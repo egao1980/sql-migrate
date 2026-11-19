@@ -1,65 +1,49 @@
 (in-package #:sql-migrate)
 
-;;; 0.1 runner API. S2: UPGRADE / DOWNGRADE become STACK-REV:PLAN-TRANSITION
-;;; + STACK-REV:EXECUTE-PLAN on a SQL-TARGET (:CHECK-DRIFT NIL); CURRENT-REVISION
-;;; and STAMP go through TARGET-REVISIONS / TARGET-STAMP.
-;;;
-;;; CONTRACT: the 0.1 implementations are kept so the 0.1 suite keeps
-;;; passing; CURRENT-REVISIONS is the only new entry point here.
-
-(defun %conn (connection)
-  (sql-orm:orm-connection connection))
-
-(defun %row-get (row key)
-  (getf row (intern (string-upcase (string key)) :keyword)))
+;;; 0.1 runner API on the S2 layer: UPGRADE / DOWNGRADE resolve their goal
+;;; along HISTORY (0.1 rules), then STACK-REV:PLAN-TRANSITION +
+;;; STACK-REV:EXECUTE-PLAN on a SQL-TARGET (:CHECK-DRIFT NIL: 0.1 never
+;;; checked drift). CURRENT-REVISION(S) and STAMP go through TARGET-REVISIONS
+;;; / TARGET-STAMP.
 
 (defun %table (dir)
   (directory-version-table dir))
 
+(defun %target-of (connection dir &key (check-drift t))
+  (make-sql-target connection :directory dir :check-drift check-drift))
+
 (defun ensure-version-table (connection dir)
   "CREATE TABLE IF NOT EXISTS the version table."
-  (let ((conn (%conn connection))
-        (table (%table dir)))
-    (sql-protocol:execute
-     conn
-     (format nil "CREATE TABLE IF NOT EXISTS ~A (version_num TEXT NOT NULL PRIMARY KEY)"
-             table))
-    table))
-
-(defun current-revision (connection dir)
-  "Stamped revision id, or NIL at base. S2: several version-table rows →
-MULTIPLE-HEADS (heads = the rows, sorted) with restart USE-VALUE."
-  (ensure-version-table connection dir)
-  (let* ((conn (%conn connection))
-         (row (sql-protocol:fetch
-               (sql-protocol:execute
-                conn
-                (format nil "SELECT version_num FROM ~A" (%table dir))))))
-    (when row
-      (or (%row-get row :version_num)
-          (%row-get row :|VERSION_NUM|)))))
+  (%ensure-table connection (%table dir)))
 
 (defun current-revisions (connection dir)
-  "S2: every stamped revision id (version-table rows), sorted STRING<; NIL at
+  "Every stamped revision id (version-table rows), sorted STRING<; NIL at
 base. = (STACK-REV:TARGET-REVISIONS (MAKE-SQL-TARGET connection :DIRECTORY dir))."
-  (declare (ignore connection dir))
-  (%not-implemented 'current-revisions))
+  (rev:target-revisions (%target-of connection dir)))
+
+(defun current-revision (connection dir)
+  "Stamped revision id, or NIL at base. Several version-table rows →
+MULTIPLE-HEADS (heads = the rows, sorted) with restart USE-VALUE."
+  (let ((ids (current-revisions connection dir)))
+    (if (rest ids)
+        (restart-case
+            (error 'multiple-heads
+                   :heads ids
+                   :message (format nil "the database is stamped with ~D revisions ~S"
+                                    (length ids) ids))
+          (use-value (id)
+            :report "Use this revision id as the current one"
+            id))
+        (first ids))))
 
 (defun stamp (connection dir revision)
-  "Record REVISION (or NIL = base) without applying ops. S2: REVISION is
-checked first (REQUIRE-REVISION), so an unknown id signals UNKNOWN-REVISION and
-leaves the version table as it was."
-  (ensure-version-table connection dir)
-  (let ((conn (%conn connection))
-        (table (%table dir)))
-    (sql-protocol:execute conn (format nil "DELETE FROM ~A" table))
-    (when revision
-      (require-revision dir revision)
-      (sql-protocol:execute
-       conn
-       (format nil "INSERT INTO ~A (version_num) VALUES (?)" table)
-       (list revision)))
-    revision))
+  "Record REVISION (or NIL = base) without applying ops → the id stamped.
+REVISION is checked first (REQUIRE-REVISION), so an unknown id signals
+UNKNOWN-REVISION and leaves the version table as it was."
+  (let ((id (and revision
+                 (sql-orm:schema-migration-revision (require-revision dir revision)))))
+    (rev:target-stamp (%target-of connection dir) (and id (list id)))
+    id))
 
 (defun %index (chain id)
   (if (null id)
@@ -69,19 +53,21 @@ leaves the version table as it was."
                     :test #'equal)
           (error 'unknown-revision
                  :revision id
+                 :designator id
                  :message (format nil "revision ~S is not on this chain" id)))))
 
 (defun %resolve-target (dir current target count direction)
-  (let* ((chain (history dir))
-         (cur-idx (%index chain current)))
+  "The goal id (NIL = base) for TARGET / COUNT from CURRENT (0.1 rules)."
+  (let ((chain (history dir)))
     (cond
       ((and target count)
        (error 'migrate-error :message "specify :target or :count, not both"))
       (count
        (check-type count (integer 1))
-       (let ((idx (ecase direction
-                    (:up (min (1- (length chain)) (+ cur-idx count)))
-                    (:down (max -1 (- cur-idx count))))))
+       (let* ((cur-idx (%index chain current))
+              (idx (ecase direction
+                     (:up (min (1- (length chain)) (+ cur-idx count)))
+                     (:down (max -1 (- cur-idx count))))))
          (if (minusp idx)
              nil
              (sql-orm:schema-migration-revision (nth idx chain)))))
@@ -89,69 +75,64 @@ leaves the version table as it was."
        (head-revision dir))
       ((eq target :base) nil)
       ((stringp target)
-       (require-revision dir target)
-       (%index chain target) ; validate on chain
-       target)
+       (let ((id (sql-orm:schema-migration-revision (require-revision dir target))))
+         (%index chain id)              ; validate on chain
+         id))
       (t
        (error 'migrate-error
               :revision target
               :message (format nil "bad target ~S" target))))))
 
-(defun %apply-step (connection dir migration direction)
-  "Run MIGRATION's DDL in DIRECTION (:UP or :DOWN) and stamp the result in
-   one transaction, so the schema change and the version row commit or roll
-   back together."
-  (check-type direction (member :up :down))
-  (sql-protocol:with-transaction ((%conn connection))
-    (ecase direction
-      (:up
-       (sql-orm:upgrade-schema connection migration :transaction nil)
-       (stamp connection dir (sql-orm:schema-migration-revision migration)))
-      (:down
-       (sql-orm:downgrade-schema connection migration :transaction nil)
-       (stamp connection dir (sql-orm:schema-migration-down-revision migration))))))
+(defun %check-current (dir current)
+  "Signal UNKNOWN-REVISION when the stamp CURRENT is not in DIR."
+  (when (and current (not (find-revision dir current)))
+    (error 'unknown-revision
+           :revision current
+           :designator current
+           :message (format nil "the database is stamped with ~S, which the directory does not hold"
+                            current))))
+
+(defun %migrate (connection dir dest direction)
+  "Plan DIR's transition to DEST and run it → the migrations applied, in
+application order (NIL when a handler chose ROLLBACK-TO-START)."
+  (let* ((target (%target-of connection dir :check-drift nil))
+         (plan (rev:plan-transition dir target dest)) ; always, even a no-op
+         (wrong (if (eq direction :up) :down :up)))
+    (when (find wrong (rev:plan-steps plan) :key #'rev:step-direction)
+      (error 'migrate-error
+             :message (if (eq direction :up)
+                          "upgrade target is behind current; use downgrade"
+                          "downgrade target is ahead of current; use upgrade")))
+    ;; A failing step signals one condition that is a STEP-FAILED and of the
+    ;; driver's class; it propagates with EXECUTE-PLAN's restarts in place.
+    (let ((result (multiple-value-list (rev:execute-plan target plan))))
+      (when (rest result)               ; completed: (revisions skipped)
+        (let ((skipped (second result)))
+          (loop for step in (rev:plan-steps plan)
+                unless (member step skipped)
+                  collect (find-revision dir (if (eq (rev:step-direction step) :up)
+                                                 (rev:step-to step)
+                                                 (rev:step-from step)))))))))
 
 (defun upgrade (connection dir &key target count)
   "Apply forward migrations from CURRENT to TARGET (:HEAD or a revision id).
    :COUNT N moves N revisions toward head. Default TARGET is :HEAD.
    → the SCHEMA-MIGRATIONs applied, in order.
-   S2: PLAN-TRANSITION + EXECUTE-PLAN on a SQL-TARGET (:CHECK-DRIFT NIL). A
-   failing step re-SIGNALs its cause first (0.1 handlers on the driver's
-   condition still fire), then STEP-FAILED propagates."
+   PLAN-TRANSITION + EXECUTE-PLAN on a SQL-TARGET (:CHECK-DRIFT NIL). A
+   failing step signals one condition that is both a STEP-FAILED and of the
+   driver's condition class (0.1 handlers on the driver's class still fire)."
   (let* ((target (if (or target count) target :head))
          (current (current-revision connection dir))
-         (dest (%resolve-target dir current target count :up))
-         (chain (history dir))
-         (from (%index chain current))
-         (to (%index chain dest))
-         (applied '()))
-    (when (< to from)
-      (error 'migrate-error
-             :message "upgrade target is behind current; use downgrade"))
-    (loop for i from (1+ from) to to
-          for mig = (nth i chain)
-          do (%apply-step connection dir mig :up)
-             (push mig applied))
-    (nreverse applied)))
+         (dest (%resolve-target dir current target count :up)))
+    (%check-current dir current)
+    (%migrate connection dir dest :up)))
 
 (defun downgrade (connection dir &key target count)
   "Roll back toward TARGET (:BASE or a revision id). Default :COUNT 1 if TARGET omitted.
-   → the SCHEMA-MIGRATIONs rolled back, in rollback order. S2: as UPGRADE."
+   → the SCHEMA-MIGRATIONs rolled back, in rollback order. As UPGRADE."
   (let* ((count (if (or target count) count 1))
          (current (current-revision connection dir))
          (dest (%resolve-target dir current (or target (and (null count) :base))
-                                count :down))
-         (chain (history dir))
-         (from (%index chain current))
-         (to (%index chain dest))
-         (applied '()))
-    (when (> to from)
-      (error 'migrate-error
-             :message "downgrade target is ahead of current; use upgrade"))
-    (when (<= from to)
-      (return-from downgrade nil))
-    (loop for i from from downto (1+ to)
-          for mig = (nth i chain)
-          do (%apply-step connection dir mig :down)
-             (push mig applied))
-    (nreverse applied)))
+                                count :down)))
+    (%check-current dir current)
+    (%migrate connection dir dest :down)))
