@@ -80,7 +80,15 @@
     (register-revision dir (make-migration nil v1 :revision "a" :down-revision nil))
     (register-revision dir (make-migration v1 v2 :revision "b" :down-revision "a"))
     (register-revision dir (make-migration v1 v2 :revision "c" :down-revision "a"))
-    (ok (signals (history dir) 'branch-not-supported))))
+    ;; S2 (locked behaviour change): a fork is a valid graph. HISTORY lists
+    ;; it; the refusal moved to planning (HEAD-REVISION → MULTIPLE-HEADS, a
+    ;; BRANCH-NOT-SUPPORTED; PLAN-TRANSITION → BRANCH-NOT-SUPPORTED).
+    (ok (equal '("a" "b" "c")
+               (sort (mapcar #'schema-migration-revision (history dir)) #'string<)))
+    (ok (equal "a" (schema-migration-revision (first (history dir)))))
+    (ok (signals (head-revision dir) 'branch-not-supported))
+    (with-orm-connection (c :driver :sqlite3 :database-name ":memory:")
+      (ok (signals (upgrade c dir :target "b") 'branch-not-supported)))))
 
 (deftest target-and-count-exclusive
   (let ((dir (%dir)))
