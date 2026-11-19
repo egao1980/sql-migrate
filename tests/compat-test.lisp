@@ -58,15 +58,17 @@
       (ok (null (current-revisions c dir))))))
 
 (deftest compat-step-failure-resignals-cause
-  "A failing step re-SIGNALs the driver's condition first (0.1 handlers fire),
-then STEP-FAILED propagates to handlers for it."
+  "A failing step signals ONE condition whose class inherits both
+REV:STEP-FAILED and the driver's own condition class, so 0.1 handlers on the
+driver class fire and STEP-FAILED handlers get the step restarts."
   (let ((dir (linear-dir)))
     (with-sqlite (c)
       (%reject-stamp c dir "0002")
-      (ok (eq :cause
-              (handler-case (upgrade c dir)
-                (rev:step-failed () :step-failed)
-                (error (e) (if (typep e 'rev:revision-error) :other :cause)))))
+      (let ((e (handler-case (upgrade c dir) (error (e) e))))
+        (ok (typep e 'rev:step-failed) "a STEP-FAILED")
+        (ok (typep e 'sqlite:sqlite-error) "and the driver's class")
+        (ok (typep (rev:step-failed-cause e) 'sqlite:sqlite-error)
+            "the cause is the driver's original condition"))
       (ok (equal "0001" (current-revision c dir)))
       (ok (eq :step-failed
               (handler-case (upgrade c dir)
