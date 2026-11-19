@@ -105,10 +105,11 @@
   (ensure-version-table c dir)
   (sql-protocol:execute
    c
-   (format nil "CREATE TRIGGER reject_stamp BEFORE INSERT ON ~A ~
-                WHEN NEW.version_num = '~A' ~
-                BEGIN SELECT RAISE(ABORT, 'stamp rejected'); END"
-           (directory-version-table dir) revision)))
+   ;; One FORMAT per clause: a ~<newline> breaks on a CRLF checkout.
+   (concatenate 'string
+                (format nil "CREATE TRIGGER reject_stamp BEFORE INSERT ON ~A " (directory-version-table dir))
+                (format nil "WHEN NEW.version_num = '~A' " revision)
+                "BEGIN SELECT RAISE(ABORT, 'stamp rejected'); END")))
 
 (defun %has-column-p (c table column)
   (loop with cur = (sql-protocol:execute
