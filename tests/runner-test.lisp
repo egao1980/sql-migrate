@@ -96,3 +96,42 @@
       (ok (null
            (sql-protocol:fetch
             (sql-protocol:execute c "SELECT name FROM sqlite_master WHERE name = 'widgets'")))))))
+
+;;; A step's DDL and its stamp commit or roll back together.  A trigger on
+;;; the version table rejects one revision id, so the step's DDL succeeds
+;;; and its stamp fails.
+
+(defun %reject-stamp (c dir revision)
+  (ensure-version-table c dir)
+  (sql-protocol:execute
+   c
+   ;; One FORMAT per clause: a ~<newline> breaks on a CRLF checkout.
+   (concatenate 'string
+                (format nil "CREATE TRIGGER reject_stamp BEFORE INSERT ON ~A " (directory-version-table dir))
+                (format nil "WHEN NEW.version_num = '~A' " revision)
+                "BEGIN SELECT RAISE(ABORT, 'stamp rejected'); END")))
+
+(defun %has-column-p (c table column)
+  (loop with cur = (sql-protocol:execute
+                    c (format nil "PRAGMA table_info(~A)" table))
+        for row = (sql-protocol:fetch cur)
+        while row
+        thereis (equalp column (getf row :name))))
+
+(deftest upgrade-stamp-failure-rolls-back-ddl
+  (let ((dir (%dir)))
+    (with-orm-connection (c :driver :sqlite3 :database-name ":memory:")
+      (%reject-stamp c dir "0002")
+      (ok (signals (upgrade c dir) 'error))
+      (ok (equal "0001" (current-revision c dir)))
+      (ok (%has-column-p c "widgets" "name"))
+      (ok (not (%has-column-p c "widgets" "color"))))))
+
+(deftest downgrade-stamp-failure-rolls-back-ddl
+  (let ((dir (%dir)))
+    (with-orm-connection (c :driver :sqlite3 :database-name ":memory:")
+      (upgrade c dir)
+      (%reject-stamp c dir "0001")
+      (ok (signals (downgrade c dir :count 1) 'error))
+      (ok (equal "0002" (current-revision c dir)))
+      (ok (%has-column-p c "widgets" "color")))))
