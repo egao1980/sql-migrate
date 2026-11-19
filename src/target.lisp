@@ -154,35 +154,71 @@ the transaction first, so it has already rolled back."
 ;;; One combined condition class per driver condition class: it inherits
 ;;; STACK-REV:STEP-FAILED and the driver's class, so a handler on either sees
 ;;; the failure, and a catch-all ERROR handler sees one condition.
+;;;
+;;; Rules for the combined condition (issues #4, #5):
+;;;  - Every bound slot of the driver condition that has an initarg is copied
+;;;    in (CLOSER-MOP, so on every implementation), so the driver's readers
+;;;    work on it. STEP-FAILED-CAUSE is the original driver condition.
+;;;  - A driver slot whose initarg is :STEP, :CAUSE or :ATTEMPT is not copied:
+;;;    it gets STEP-FAILED's value (the step, the cause, the attempt).
+;;;  - PRINC prints STEP-FAILED's report only, which prints the cause once.
+;;;    The driver's own PRINT-OBJECT methods (cl-sqlite's :AFTER, which adds
+;;;    the Code / Database / SQL block) do not run on the combined condition;
+;;;    they run when the report prints the cause. PRIN1 is unchanged.
+
+(define-condition step-failed-combination (rev:step-failed) ()
+  (:documentation "Superclass of every combined STEP-FAILED/<driver> class
+(before the driver's class in its precedence list)."))
+
+(defmethod print-object :around ((condition step-failed-combination) stream)
+  (if *print-escape*
+      (call-next-method)
+      ;; STEP-FAILED's own report, without the driver's PRINT-OBJECT methods.
+      (princ (make-condition 'rev:step-failed
+                             :step (rev:step-failed-step condition)
+                             :cause (rev:step-failed-cause condition)
+                             :attempt (rev:step-failed-attempt condition))
+             stream)))
 
 (defvar *step-failed-classes* (make-hash-table :test 'eq)
-  "Driver condition class → the combined STEP-FAILED class made for it.")
+  "Driver condition class → the combined STEP-FAILED class made for it.
+Read and written under *STEP-FAILED-CLASSES-LOCK*.")
+
+(defvar *step-failed-classes-lock*
+  (bt:make-lock "sql-migrate step-failed classes"))
 
 (defun %step-failed-class (cause)
-  "Name of the condition class signalled for a step failing with CAUSE."
+  "Name of the condition class signalled for a step failing with CAUSE.
+Thread-safe: one combined class per driver class."
   (let* ((class (class-of cause))
          (name (class-name class)))
     (if (or (null name)
             (not (eq class (find-class name nil)))
             (subtypep class 'rev:step-failed))
         'rev:step-failed
-        (or (gethash class *step-failed-classes*)
-            (let ((combined (make-symbol (format nil "STEP-FAILED/~A" name))))
-              ;; The driver class is only known at run time.
-              (eval `(define-condition ,combined (rev:step-failed ,name) ()
-                       (:documentation "A plan step failed with a driver condition of this class.")))
-              (setf (gethash class *step-failed-classes*) combined))))))
+        (bt:with-lock-held (*step-failed-classes-lock*)
+          (or (gethash class *step-failed-classes*)
+              (let ((combined (make-symbol (format nil "STEP-FAILED/~A" name))))
+                ;; The driver class is only known at run time.
+                (eval `(define-condition ,combined (step-failed-combination ,name) ()
+                         (:documentation "A plan step failed with a driver condition of this class.")))
+                (setf (gethash class *step-failed-classes*) combined)))))))
+
+(defparameter *%step-failed-initargs* '(:step :cause :attempt)
+  "Initargs STEP-FAILED sets; a driver slot with one of them is not copied.")
 
 (defun %cause-initargs (cause)
-  "Initargs that copy CAUSE's bound slots into a condition of a subclass."
-  #+sbcl
-  (loop for slot in (sb-mop:class-slots (class-of cause))
-        for name = (sb-mop:slot-definition-name slot)
-        for initarg = (first (sb-mop:slot-definition-initargs slot))
-        when (and initarg (slot-boundp cause name))
-          append (list initarg (slot-value cause name)))
-  #-sbcl
-  (progn cause nil))
+  "Initargs that copy CAUSE's bound slots into a condition of a subclass:
+slots with an initarg other than :STEP / :CAUSE / :ATTEMPT."
+  (let ((class (class-of cause)))
+    (c2mop:ensure-finalized class)
+    (loop for slot in (c2mop:class-slots class)
+          for name = (c2mop:slot-definition-name slot)
+          for initarg = (first (c2mop:slot-definition-initargs slot))
+          when (and initarg
+                    (not (member initarg *%step-failed-initargs*))
+                    (slot-boundp cause name))
+            append (list initarg (slot-value cause name)))))
 
 (defun %signal-step-failed (step cause attempt)
   (let ((class (%step-failed-class cause)))
