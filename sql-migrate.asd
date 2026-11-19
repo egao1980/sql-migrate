@@ -1,11 +1,13 @@
 (defsystem "sql-migrate"
-  :version "0.2.0"
+  :version "0.2.1"
   :description "Alembic-style revision runner on sql-orm schema-op (stack-sql-migrate): a revision-protocol store of schema-op migrations, a diff-protocol schema engine, and a SQL revision target"
   :author "egao1980"
   :license "MIT"
   :depends-on ((:version "sql-orm" "0.2.0")
                (:version "revision-protocol" "0.2.0")
-               (:version "diff-protocol" "0.2.0"))
+               (:version "diff-protocol" "0.2.0")
+               "closer-mop"
+               "bordeaux-threads")
   :properties
   (:cl-repo
    (:ci (:with ("sql-backend-sqlite3" "sql-query-sqlite3" "sql-query-postgres")

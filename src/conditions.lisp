@@ -13,7 +13,8 @@
 ;;;
 ;;; A failing plan step signals one condition that is both a
 ;;; STACK-REV:STEP-FAILED and an instance of the driver's condition class
-;;; (see %STEP-FAILED-CLASS in target.lisp).
+;;; (see %STEP-FAILED-CLASS in target.lisp for the slot-copy, initarg and
+;;; report rules).
 
 (define-condition migrate-error (rev:revision-error)
   ((revision :initarg :revision :reader migrate-error-revision :initform nil))
@@ -31,11 +32,16 @@ string. REVISION is the id concerned, or NIL."))
 
 (define-condition unknown-revision (migrate-error rev:revision-not-found) ()
   (:report (lambda (c s)
-             (format s "sql-migrate: unknown revision ~S~@[: ~A~]"
-                     (rev:revision-not-found-designator c)
-                     (rev:revision-error-message c))))
+             ;; The message names the id already; print the id alone only
+             ;; when there is no message.
+             (let ((message (rev:revision-error-message c)))
+               (if message
+                   (format s "sql-migrate: ~A" message)
+                   (format s "sql-migrate: unknown revision ~S"
+                           (rev:revision-not-found-designator c))))))
   (:documentation "A revision id the directory does not hold. Also a
-STACK-REV:REVISION-NOT-FOUND whose designator is the id."))
+STACK-REV:REVISION-NOT-FOUND whose designator is the id. Its report is the
+message (which names the id), else \"unknown revision <id>\"."))
 
 (define-condition branch-not-supported (migrate-error) ()
   (:documentation "Deprecated (S3 adds branches). Signalled by
