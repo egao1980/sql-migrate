@@ -1,5 +1,5 @@
 (defsystem "sql-migrate"
-  :version "0.1.0"
+  :version "0.1.1"
   :description "Alembic-style revision runner on sql-orm schema-op (stack-sql-migrate)"
   :author "egao1980"
   :license "MIT"

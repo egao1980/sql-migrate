@@ -81,6 +81,20 @@
               :revision target
               :message (format nil "bad target ~S" target))))))
 
+(defun %apply-step (connection dir migration direction)
+  "Run MIGRATION's DDL in DIRECTION (:UP or :DOWN) and stamp the result in
+   one transaction, so the schema change and the version row commit or roll
+   back together."
+  (check-type direction (member :up :down))
+  (sql-protocol:with-transaction ((%conn connection))
+    (ecase direction
+      (:up
+       (sql-orm:upgrade-schema connection migration :transaction nil)
+       (stamp connection dir (sql-orm:schema-migration-revision migration)))
+      (:down
+       (sql-orm:downgrade-schema connection migration :transaction nil)
+       (stamp connection dir (sql-orm:schema-migration-down-revision migration))))))
+
 (defun upgrade (connection dir &key target count)
   "Apply forward migrations from CURRENT to TARGET (:HEAD or a revision id).
    :COUNT N moves N revisions toward head. Default TARGET is :HEAD."
@@ -96,8 +110,7 @@
              :message "upgrade target is behind current; use downgrade"))
     (loop for i from (1+ from) to to
           for mig = (nth i chain)
-          do (sql-orm:upgrade-schema connection mig)
-             (stamp connection dir (sql-orm:schema-migration-revision mig))
+          do (%apply-step connection dir mig :up)
              (push mig applied))
     (nreverse applied)))
 
@@ -118,7 +131,6 @@
       (return-from downgrade nil))
     (loop for i from from downto (1+ to)
           for mig = (nth i chain)
-          do (sql-orm:downgrade-schema connection mig)
-             (stamp connection dir (sql-orm:schema-migration-down-revision mig))
+          do (%apply-step connection dir mig :down)
              (push mig applied))
     (nreverse applied)))
