@@ -27,6 +27,7 @@
                "sql-query-postgres"
                "revision-protocol"
                "diff-protocol"
+               "bordeaux-threads"
                "rove")
   :pathname "tests"
   :serial t
