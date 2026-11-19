@@ -1,5 +1,12 @@
 (in-package #:sql-migrate)
 
+;;; 0.1 runner API. S2: UPGRADE / DOWNGRADE become STACK-REV:PLAN-TRANSITION
+;;; + STACK-REV:EXECUTE-PLAN on a SQL-TARGET (:CHECK-DRIFT NIL); CURRENT-REVISION
+;;; and STAMP go through TARGET-REVISIONS / TARGET-STAMP.
+;;;
+;;; CONTRACT: the 0.1 implementations are kept so the 0.1 suite keeps
+;;; passing; CURRENT-REVISIONS is the only new entry point here.
+
 (defun %conn (connection)
   (sql-orm:orm-connection connection))
 
@@ -20,7 +27,8 @@
     table))
 
 (defun current-revision (connection dir)
-  "Stamped revision id, or NIL at base."
+  "Stamped revision id, or NIL at base. S2: several version-table rows →
+MULTIPLE-HEADS (heads = the rows, sorted) with restart USE-VALUE."
   (ensure-version-table connection dir)
   (let* ((conn (%conn connection))
          (row (sql-protocol:fetch
@@ -31,8 +39,16 @@
       (or (%row-get row :version_num)
           (%row-get row :|VERSION_NUM|)))))
 
+(defun current-revisions (connection dir)
+  "S2: every stamped revision id (version-table rows), sorted STRING<; NIL at
+base. = (STACK-REV:TARGET-REVISIONS (MAKE-SQL-TARGET connection :DIRECTORY dir))."
+  (declare (ignore connection dir))
+  (%not-implemented 'current-revisions))
+
 (defun stamp (connection dir revision)
-  "Record REVISION (or NIL = base) without applying ops."
+  "Record REVISION (or NIL = base) without applying ops. S2: REVISION is
+checked first (REQUIRE-REVISION), so an unknown id signals UNKNOWN-REVISION and
+leaves the version table as it was."
   (ensure-version-table connection dir)
   (let ((conn (%conn connection))
         (table (%table dir)))
@@ -97,7 +113,11 @@
 
 (defun upgrade (connection dir &key target count)
   "Apply forward migrations from CURRENT to TARGET (:HEAD or a revision id).
-   :COUNT N moves N revisions toward head. Default TARGET is :HEAD."
+   :COUNT N moves N revisions toward head. Default TARGET is :HEAD.
+   → the SCHEMA-MIGRATIONs applied, in order.
+   S2: PLAN-TRANSITION + EXECUTE-PLAN on a SQL-TARGET (:CHECK-DRIFT NIL). A
+   failing step re-SIGNALs its cause first (0.1 handlers on the driver's
+   condition still fire), then STEP-FAILED propagates."
   (let* ((target (if (or target count) target :head))
          (current (current-revision connection dir))
          (dest (%resolve-target dir current target count :up))
@@ -115,7 +135,8 @@
     (nreverse applied)))
 
 (defun downgrade (connection dir &key target count)
-  "Roll back toward TARGET (:BASE or a revision id). Default :COUNT 1 if TARGET omitted."
+  "Roll back toward TARGET (:BASE or a revision id). Default :COUNT 1 if TARGET omitted.
+   → the SCHEMA-MIGRATIONs rolled back, in rollback order. S2: as UPGRADE."
   (let* ((count (if (or target count) count 1))
          (current (current-revision connection dir))
          (dest (%resolve-target dir current (or target (and (null count) :base))

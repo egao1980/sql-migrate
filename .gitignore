@@ -6,3 +6,4 @@
 .cl-repository/
 _deps/
 cl-repo.lock
+.team-solve/

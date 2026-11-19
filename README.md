@@ -4,6 +4,8 @@ Alembic-style **revision runner** for [cl-stack](https://github.com/egao1980/cl-
 
 Linear history in 0.1.0 (no branches). Scripts live in a `script-directory` (in-memory). File layout later.
 
+**0.2.0 (S2, contract on this branch):** the `script-directory` becomes a [`revision-protocol`](https://github.com/egao1980/revision-protocol) store (`:primary :delta`, content = each migration's schema ops), diffs come from a [`diff-protocol`](https://github.com/egao1980/diff-protocol) `schema-diff-engine` (footprints, lossy drops, `render-diff :sql`), and a `sql-target` runs `plan-transition` / `execute-plan` with each step's DDL and stamp in one transaction. The 0.1 API stays. Brief: [cl-stack `docs/capabilities/sql.md`](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/sql.md) → "sql-migrate 0.2.0 — S2 locked".
+
 ```lisp
 (asdf:load-system "sql-migrate")
 
